@@ -1,3 +1,5 @@
+"""Implementation of the web page inliner."""
+
 import base64
 import logging
 
@@ -16,6 +18,17 @@ log.addHandler(handler)
 log.setLevel(logging.INFO)
 
 class InliningParser():
+    """
+    Main class that does all the work.
+
+    Args:
+    * `source` - URL or path to source file
+    * `outf` - something that supports `.write(str)` for the result to be written to
+    * `pretty` - if true, pretty-print the output HTML
+
+    Note that `pretty` is a relative term here - no attempt is made to prettify
+    eg inline JavaScript.
+    """
     def __init__(self, source, outf, pretty, *args, **kwargs):
         super().__init__(*args, **kwargs)
         try:
@@ -31,6 +44,10 @@ class InliningParser():
         self.pretty = pretty
 
     def retrieve_file(self, name):
+        """Get a file, possibly taking into account the root of the site, if the
+        page was retrieved from a server.
+
+        `name` can be a URL, an absolute path or a relative path."""
         try:
             url = urlparse(name)
             if not url.scheme:
@@ -48,11 +65,13 @@ class InliningParser():
         return response.info().get_content_type(), response.read()
 
     def load_css(self, href):
+        """Retrive a CSS file and inline the things it imports."""
         log.info('Inlining CSS %s', href)
         content_type, content = self.retrieve_file(href)
         return self.inline_css_imports(content.decode('utf-8'), href)
 
     def inline_css_imports(self, content, href):
+        """Inline imports and fonts into a CSS file."""
         stylesheet = tinycss2.parse_stylesheet(content)
         for rule in stylesheet:
             if rule.type == "error":
@@ -89,10 +108,12 @@ class InliningParser():
         return stylesheet
 
     def data_as_url(self, content, content_type):
+        """Convert byte data to a `data:` url of the given content type."""
         encoded = base64.standard_b64encode(content).decode('utf-8')
         return f"data:{content_type};base64,{encoded}"
 
     def process(self):
+        """Actually do the inlining"""
         content_type, content = self.retrieve_file(self.source)
         soup = BeautifulSoup(content, "lxml")
         for tag in soup.find_all("noscript"):
@@ -152,6 +173,7 @@ class InliningParser():
 @click.option('--pretty/--no-pretty', default=False)
 @click.argument('name')
 def main(output, name, pretty):
+    """Main CLI"""
     out = Path(output).open('w')
     InliningParser(name, out, pretty).process()
 
