@@ -3,11 +3,11 @@ import logging
 
 from urllib.parse import urlparse
 from urllib.request import urlopen
-from html.parser import HTMLParser
 from pathlib import Path
 
 import click
 import tinycss2
+from bs4 import BeautifulSoup, Comment
 
 log = logging.getLogger('inliner')
 handler = logging.StreamHandler()
@@ -15,10 +15,9 @@ handler.setLevel(logging.DEBUG)
 log.addHandler(handler)
 log.setLevel(logging.INFO)
 
-class InliningParser(HTMLParser):
-    def __init__(self, source, outf, *args, **kwargs):
+class InliningParser():
+    def __init__(self, source, outf, pretty, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.source = source
         try:
             url = urlparse(source)
             self.base = f"{url.scheme}://{url.netloc}"
@@ -27,10 +26,9 @@ class InliningParser(HTMLParser):
             self.base = f"file://{source_path.parent}"
             source = source_path.name
 
+        self.source = source
         self.outf = outf
-        self.skipping = []
-        self.in_style = False
-        self.feed(self.retrieve_file(source)[1].decode('utf-8'))
+        self.pretty = pretty
 
     def retrieve_file(self, name):
         try:
@@ -80,98 +78,82 @@ class InliningParser(HTMLParser):
                     if (token.type == "function" and
                         token.name == "url"):
                         url = token.arguments[0].value
-                        log.info("Inlining CSS font %s", url)
-                        content_type, content = self.retrieve_file(url)
-                        token.arguments[0].representation = f'"data:{content_type};{base64.standard_b64encode(content)}"'
+                        if url.startswith('data:'):
+                            log.info("Found already-inline CSS font")
+                        else:
+                            log.info("Inlining CSS font %s", url)
+                            content_type, content = self.retrieve_file(url)
+                            token.arguments[0].representation = self.data_as_url(content, content_type)
 
             ii += 1
         return stylesheet
 
-    def handle_starttag(self, tag, attrs):
-        attr_dict = {x: y for x, y in attrs}
-        if tag == "noscript":
-            self.skipping.append(tag)
-            return
-        if self.skipping:
-            return
-        if tag == "svg":
-            log.info("Found SVG already inline")
-        if tag == "link":
-            if attr_dict.get('rel') == "stylesheet":
+    def data_as_url(self, content, content_type):
+        encoded = base64.standard_b64encode(content).decode('utf-8')
+        return f"data:{content_type};base64,{encoded}"
+
+    def process(self):
+        content_type, content = self.retrieve_file(self.source)
+        soup = BeautifulSoup(content, "lxml")
+        for tag in soup.find_all("noscript"):
+            tag.decompose()
+
+        for tag in soup.find_all(string=lambda text: isinstance(text, Comment)):
+            tag.decompose()
+
+        for tag in soup.find_all('style'):
+            stylesheet = self.inline_css_imports(tag.string, 'inline')
+            tag.string = ("\n" if self.pretty else "").join(rule.serialize() for rule in stylesheet)
+
+        for tag in soup.find_all('link'):
+            if 'stylesheet' in tag.get('rel'):
                 href = None
-                if attr_dict.get('href'):
-                    href = attr_dict.get('href')
-                    del attr_dict['href']
-                elif attr_dict.get('data-href'):
-                    href = attr_dict.get('data-href')
-                    del attr_dict['data-href']
+                if tag.get('href'):
+                    href = tag.get('href')
+                    del tag['href']
+                elif tag.get('data-href'):
+                    href = tag.get('data-href')
+                    del tag['data-href']
                 if href:
                     stylesheet = self.load_css(href)
-                    self.outf.write("<style>")
-                    for rule in stylesheet:
-                        self.outf.write(rule.serialize())
-                    self.outf.write(f"</style>")
-                    return
-        if tag == "style":
-            self.outf.write(f'<{tag}>')
-            self.in_style = True
-            self.style_data = ""
-            return
-        if tag == "script":
-            if attr_dict.get('src'):
-                log.info('Inlining JavaScript %s', attr_dict.get('src'))
-                content_type, content = self.retrieve_file(attr_dict.get('src'))
-                self.outf.write(f"<script>{content.decode('utf-8')}")
-                return
+                    style = soup.new_tag('style')
+                    style.string = "".join(rule.serialize() for rule in stylesheet)
+                    tag.replace_with(style)
 
-        if tag == "img":
-            log.info("Found image at %s", attr_dict.get('src'))
-        #     if attr_dict.get('src').startswith('data:'):
-        #         pass
-        #     else:
-        #         url = attr_dict.get('src')
-        #         content_type, content = self.retrieve_file(url)
+        for tag in soup.find_all('script'):
+            if tag.get('src'):
+                log.info('Inlining JavaScript %s', tag.get('src'))
+                content_type, content = self.retrieve_file(tag.get('src'))
+                del tag['src']
+                tag.string = content.decode('utf-8')
 
-        #         attr_dict['src'] = f"data:{content_type};{base64.standard_b64encode(content)}"
+        for tag in soup.find_all('img'):
+            if tag.get('src').startswith('data:'):
+                log.info("Found already-inline image")
+            else:
+                content_type, content = self.retrieve_file(tag.get('src'))
+                log.info("Inlining %s image from %s", content_type, tag.get('src'))
+                if content_type == 'image/svg+xml':
+                    image_soup = BeautifulSoup(content, 'lxml')
+                    tag.replace_with(image_soup)
+                else:
+                    tag['src'] = self.data_as_url(content, content_type)
 
-        self.outf.write("<{tag} {attrs}>".format(
-            tag=tag,
-            attrs=" ".join(f'{x}="{y}"' for x,y in attrs)
-        ))
+        for tag in soup.find_all('svg'):
+            log.info("Found SVG already inline")
 
-    def handle_endtag(self, tag):
-        if self.skipping and tag == self.skipping[-1]:
-            self.skipping.pop()
-            return
-        if self.in_style:
-            self.in_style = False
-            stylesheet = self.inline_css_imports(self.style_data, 'inline')
-            for rule in stylesheet:
-                self.outf.write(rule.serialize())
-        self.outf.write(f"</{tag}>")
-
-    def handle_data(self, data):
-        if self.in_style:
-            self.style_data += data
-            return
-        self.outf.write(data)
-
-    def handle_comment(self, data):
-        pass
-
-    def handle_decl(self, data):
-        self.outf.write(f"<!{data}>\n")
-
-    def handle_pi(self, data):
-        self.outf.write(f"<?{data}>")
-
+        if self.pretty:
+            self.outf.write(str(soup.prettify()))
+        else:
+            self.outf.write(str(soup))
 
 @click.command()
 @click.option('--output', '-o', default="index.html")
+@click.option('--pretty/--no-pretty', default=False)
 @click.argument('name')
-def main(output, name):
-    out = Path('index.html').open('w')
-    InliningParser(name, out)
+def main(output, name, pretty):
+    out = Path(output).open('w')
+    InliningParser(name, out, pretty).process()
 
 if __name__ == '__main__':
     main()
